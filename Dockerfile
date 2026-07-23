@@ -1,88 +1,72 @@
-# Use Ubuntu LTS
-FROM ubuntu:22.04
+# Agent DVR 7.7.4.0
+# FFmpeg is bundled inside the Agent zip as of recent 7.x - there is no
+# separate ffmpeg7 tarball to download. The old blob URL now 404s.
 
-# Define download location variables
+FROM ubuntu:24.04
 
-
-ARG FILE_LOCATION="https://files.ispyconnect.com/downloads/Agent_Linux64_7_7_4_0.zip"
-
-
-
-ENV FILE_LOCATION_SET=${FILE_LOCATION:+true}
-ENV DEFAULT_FILE_LOCATION="https://www.ispyconnect.com/api/Agent/DownloadLocation4?platform=Linux64&fromVersion=0"
-ARG DEBIAN_FRONTEND=noninteractive 
+ARG DEBIAN_FRONTEND=noninteractive
 ARG TZ=America/Los_Angeles
-ARG name
-    
 
-# Download and install dependencies
+# Primary CDN, with the GitHub release mirror as fallback.
+# To change version, update BOTH of these.
+ARG FILE_LOCATION="https://files.ispyconnect.com/downloads/Agent_Linux64_7_7_4_0.zip"
+ARG MIRROR_LOCATION="https://github.com/ispysoftware/agent-install-scripts/releases/download/v7.7.4.0/Agent_Linux64_7_7_4_0.zip"
+
+# Core dependencies - mirrors the official v3 installer's apt list
 RUN apt-get update \
-    && apt-get install -y wget unzip software-properties-common alsa-utils apt-transport-https libxext-dev fontconfig libva-drm2
+    && apt-get install --no-install-recommends -y \
+        ca-certificates \
+        wget \
+        curl \
+        unzip \
+        xz-utils \
+        apt-transport-https \
+        alsa-utils \
+        libxext-dev \
+        fontconfig \
+        libva-drm2 \
+        tzdata
 
-# Download/Install iSpy Agent DVR: 
-# Check if we were given a specific version
-RUN if [ "${FILE_LOCATION_SET}" = "true" ]; then \
-    echo "Downloading from specific location: ${FILE_LOCATION}" && \
-    wget -c ${FILE_LOCATION} -O agent.zip; \
-    else \
-    #Get latest instead
-    echo "Downloading latest" && \
-    wget -c $(wget -qO- "https://www.ispyconnect.com/api/Agent/DownloadLocation4?platform=Linux64&fromVersion=0" | tr -d '"') -O agent.zip; \
-    fi && \
-    unzip agent.zip -d /agent && \
-    rm agent.zip
-    
-# Install libgdiplus, used for smart detection
-RUN apt-get install -y libgdiplus
+# VAAPI GPU drivers - best effort, non-fatal.
+# Only useful if you pass /dev/dri into the container at runtime.
+RUN apt-get install --no-install-recommends -y mesa-va-drivers || echo "mesa-va-drivers unavailable - AMD VAAPI disabled" \
+    && apt-get install --no-install-recommends -y intel-media-va-driver || echo "intel driver unavailable - QuickSync disabled"
 
-# Ensure the target ffmpeg directory exists
-RUN mkdir -p /agent/ffmpeg7
-# Download and extract the archive to the specified directory
-RUN wget https://ispyrtcdata.blob.core.windows.net/downloads/ffmpeg7-linuxx64.tar.xz &&\
-    tar -xvf ffmpeg7-linuxx64.tar.xz --strip-components=1 -C "/agent/ffmpeg7"
+# Download Agent DVR, falling back to the GitHub mirror if the CDN is throttled
+RUN wget -c "${FILE_LOCATION}" -O agent.zip \
+    || wget -c "${MIRROR_LOCATION}" -O agent.zip
 
-    
-# Install Time Zone
-RUN apt-get install -y tzdata
+RUN unzip agent.zip -d /agent \
+    && rm agent.zip
 
-# Install curl, used for calling external webservices in Commands
-RUN apt-get install -y curl
+# Sanity check: confirm the bundled ffmpeg actually arrived.
+# Fails the build loudly rather than at runtime if the layout changes again.
+RUN find /agent -iname "*ffmpeg*" -maxdepth 2 | grep -q . \
+    || (echo "ERROR: no ffmpeg found in the Agent package - check the zip layout" && exit 1)
 
-# Clean up
-RUN apt-get -y --purge remove unzip wget build-essential \ 
-    && apt autoremove -y \
+# Permissions - discover scripts rather than hardcoding names
+RUN chmod +x /agent/Agent \
+    && find /agent -name "*.sh" -exec chmod +x {} \; \
+    && if [ -f /agent/TURN/turnserver ]; then chmod +x /agent/TURN/turnserver; fi
+
+# Cleanup
+RUN apt-get -y --purge remove wget \
+    && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Docker needs to run a TURN server to get webrtc traffic to and from it over forwarded ports from the host
-# These are the default ports. If the ports below are modified here you'll also need to set the ports in XML/Config.xml
-# for example <TurnServerPort>3478</TurnServerPort><TurnServerMinPort>50000</TurnServerMinPort><TurnServerMaxPort>50010</TurnServerMaxPort>
-# The main server port is overridden by creating a text file called port.txt in the root directory containing the port number, eg: 8090
-# To access the UI you must use the local IP address of the host, NOT localhost - for example http://192.168.1.12:8090/
-
-# Modify permission for execution
-RUN echo "Adding executable permissions" && \
-    chmod +x /agent/Agent && \
-    chmod +x /agent/agent-register.sh && \
-    chmod +x /agent/agent-reset.sh && \
-    chmod +x /agent/agent-reset-local-login.sh
-
-# Define default environment variables
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# Fix a memory leak on encoded recording
+# Mitigates a memory leak on encoded recording
 ENV MALLOC_TRIM_THRESHOLD_=100000
 
-# Main UI port
+# Main UI port. Override by placing a port.txt containing the port number
+# in /agent/Media/XML/
 EXPOSE 8090
-
-# STUN server port
+# STUN
 EXPOSE 3478/udp
-
-# TURN server UDP port range
+# TURN relay range - must match <TurnServerMinPort>/<TurnServerMaxPort> in Config.xml
 EXPOSE 50000-50100/udp
 
-# Data volumes
 VOLUME ["/agent/Media/XML", "/agent/Media/WebServerRoot/Media", "/agent/Commands"]
 
-# Define service entrypoint
 CMD ["/agent/Agent"]
